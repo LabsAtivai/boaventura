@@ -13,7 +13,8 @@ Inclusão de CNPJ, valor da causa e dados de contato potenciais.
 Isso reduz o tempo de coleta manual (de ~1 semana para horas/dias) e melhora a precisão dos contatos comerciais.
 
 Status Atual
-Fase 1 – Concluída ✅
+Fase 1 
+Quase concluida! - problema na parte de calendario, melhorar o indentificação de calendario e pautas!
 Extração completa das pautas de audiências futuras via JTe (sistema público de pautas).
 
 Fase 2 – Em desenvolvimento ⏳
