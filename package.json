@@ -1,0 +1,25 @@
+{
+  "name": "boaventura",
+  "version": "1.0.0",
+  "description": "automação de trt para cliente",
+  "homepage": "https://github.com/LabsAtivai/boaventura#readme",
+  "bugs": {
+    "url": "https://github.com/LabsAtivai/boaventura/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LabsAtivai/boaventura.git"
+  },
+  "license": "ISC",
+  "author": "Labs",
+  "type": "commonjs",
+  "main": "PAUTA-JRT2.js",
+  "scripts": {
+    "test": "node PAUTA-JRT2.js",
+    "dev": "nodemon PAUTA-JRT2.js"
+  },
+  "dependencies": {
+    "nodemon": "^3.1.11",
+    "playwright": "^1.58.0"
+  }
+}
