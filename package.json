@@ -16,9 +16,13 @@
   "main": "PAUTA-JRT2.js",
   "scripts": {
     "test": "node PAUTA-JRT2.js",
-    "dev": "nodemon PAUTA-JRT2.js"
+    "dev": "nodemon index.js"
   },
   "dependencies": {
+    "dotenv": "^17.2.3",
+    "exceljs": "^4.4.0",
+    "mysql2": "^3.16.2",
+    "nodemailer": "^7.0.13",
     "nodemon": "^3.1.11",
     "playwright": "^1.58.0"
   }
