@@ -1,256 +1,218 @@
 /**
- * JTe Pauta -> MySQL + XLSX + Email SMTP
+ * JTe Pauta TRT-2 — Scraper completo
  *
- * deps:
- *   npm i playwright mysql2 nodemailer exceljs
+ * O que faz:
+ *   1. Acessa o JTe público e coleta pautas das varas de SP (Zonas Central, Norte e Oeste)
+ *   2. Para cada processo na pauta, abre o detalhe e verifica se o polo passivo está vazio
+ *      OU se todos os polos passivos não têm advogado constituído
+ *   3. Salva os processos encontrados no MySQL (upsert), gera XLSX e envia por e-mail
  *
- * env (exemplo):
- *   DB_ENABLED=true
- *   DB_HOST=127.0.0.1
- *   DB_PORT=3306
- *   DB_USER=root
- *   DB_PASS=senha
- *   DB_NAME=jte
+ * Período: +1 dia até +7 dias úteis a partir de hoje
  *
- *   SMTP_HOST=smtp.office365.com
- *   SMTP_PORT=587
- *   SMTP_SECURE=false
- *   SMTP_USER=seu-email@dominio.com
- *   SMTP_PASS=sua-senha-ou-app-password
- *   MAIL_FROM="Robô JTe <seu-email@dominio.com>"
- *   MAIL_TO=destinatario@dominio.com;dest2@dominio.com
+ * Deps: npm i playwright mysql2 nodemailer exceljs dotenv
+ *
+ * Variáveis de ambiente (.env):
+ *   DB_ENABLED, DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME
+ *   SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_USER, SMTP_PASS
+ *   MAIL_FROM, MAIL_TO
+ *   DEBUG_HTML=true  (opcional: salva HTML dos primeiros processos para inspeção)
  */
-require('dotenv').config();
-const { chromium } = require('playwright');
-const fs = require('fs');
-const path = require('path');
-const mysql = require('mysql2/promise');
-const nodemailer = require('nodemailer');
-const ExcelJS = require('exceljs');
 
-/* =========================
-   CSV HELPERS
-========================= */
+require("dotenv").config();
+
+const { chromium } = require("playwright");
+const fs = require("fs");
+const path = require("path");
+const mysql = require("mysql2/promise");
+const nodemailer = require("nodemailer");
+const ExcelJS = require("exceljs");
+
+/* ─────────────────────────────────────────
+   HELPERS GERAIS
+───────────────────────────────────────── */
+
+function getEnv(name, fallback = undefined) {
+  const v = process.env[name];
+  return v === undefined || v === null || v === "" ? fallback : v.trim();
+}
+
+function isTrue(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "true" || s === "1";
+}
 
 function csvEscape(value) {
-  if (value === null || value === undefined) return '';
+  if (value === null || value === undefined) return "";
   const s = String(value);
-  if (/[;"\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  if (/[;"'\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
 
 function writeCsv(filePath, headers, rows) {
-  const bom = '\uFEFF';
-  const lines = [];
-  lines.push(headers.map(csvEscape).join(';'));
-  for (const row of rows) {
-    lines.push(headers.map((h) => csvEscape(row[h])).join(';'));
-  }
-  fs.writeFileSync(filePath, bom + lines.join('\n'), 'utf8');
+  const lines = [headers.map(csvEscape).join(";")];
+  for (const row of rows)
+    lines.push(headers.map((h) => csvEscape(row[h])).join(";"));
+  fs.writeFileSync(filePath, "\uFEFF" + lines.join("\n"), "utf8");
+  console.log(`💾 CSV salvo: ${filePath} (${rows.length} linhas)`);
 }
 
-/* =========================
+/* ─────────────────────────────────────────
    DATE HELPERS
-========================= */
+───────────────────────────────────────── */
 
 function parseBRDate(br) {
-  const [dd, mm, yyyy] = br.split('/').map(Number);
+  const [dd, mm, yyyy] = br.split("/").map(Number);
   return new Date(yyyy, mm - 1, dd);
 }
 
-function isWeekdayBR(dataBR) {
-  const d = parseBRDate(dataBR);
-  const day = d.getDay();
+function brToIso(br) {
+  const d = parseBRDate(br);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function isWeekday(dataBR) {
+  const day = parseBRDate(dataBR).getDay();
   return day !== 0 && day !== 6;
 }
 
-function getTodayBR() {
-  const hoje = new Date();
-  const dd = String(hoje.getDate()).padStart(2, '0');
-  const mm = String(hoje.getMonth() + 1).padStart(2, '0');
-  const yyyy = hoje.getFullYear();
-  return `${dd}/${mm}/${yyyy}`;
-}
-
-function gerarDatasProximosDoisMeses() {
+/** Gera dias úteis de +1 dia até +7 dias corridos */
+function gerarDatasProximos7Dias() {
   const hoje = new Date();
   const datas = [];
 
-  let current = new Date(hoje);
-  current.setDate(current.getDate() + 7);
+  const inicio = new Date(hoje);
+  inicio.setDate(inicio.getDate() + 1); // começa amanhã
 
   const fim = new Date(hoje);
-  fim.setMonth(fim.getMonth() + 2);
-  fim.setDate(fim.getDate() + 10);
+  fim.setDate(fim.getDate() + 7); // 7 dias corridos à frente
 
-  while (current <= fim) {
-    const dd = String(current.getDate()).padStart(2, '0');
-    const mm = String(current.getMonth() + 1).padStart(2, '0');
-    const yyyy = current.getFullYear();
-    const dataBR = `${dd}/${mm}/${yyyy}`;
-
-    if (isWeekdayBR(dataBR)) datas.push(dataBR);
-    current.setDate(current.getDate() + 1);
+  let cur = new Date(inicio);
+  while (cur <= fim) {
+    const dd = String(cur.getDate()).padStart(2, "0");
+    const mm = String(cur.getMonth() + 1).padStart(2, "0");
+    const yyyy = cur.getFullYear();
+    const br = `${dd}/${mm}/${yyyy}`;
+    if (isWeekday(br)) datas.push(br);
+    cur.setDate(cur.getDate() + 1);
   }
 
+  console.log(
+    `📅 ${datas.length} dias úteis gerados (${datas[0]} → ${datas[datas.length - 1]})`,
+  );
   return datas;
 }
 
-/* =========================
-   DB (MySQL)
-========================= */
+/* ─────────────────────────────────────────
+   MYSQL
+───────────────────────────────────────── */
 
-function getEnv(name, fallback = undefined) {
-  const v = process.env[name];
-  return (v === undefined || v === null || v === '') ? fallback : v;
-}
-
-function isTrue(v) {
-  return String(v ?? '').trim().toLowerCase() === 'true' || String(v ?? '').trim() === '1';
-}
-
-async function openDb() {
-  const host = getEnv('DB_HOST', '127.0.0.1'); // ✅ melhor que localhost no Windows
-  const port = Number(getEnv('DB_PORT', '3306'));
-  const user = getEnv('DB_USER', 'root');
-  const password = getEnv('DB_PASS', '');
-  const database = getEnv('DB_NAME', 'jte');
-
-  const pool = mysql.createPool({
-    host,
-    port,
-    user,
-    password,
-    database,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0,
-    multipleStatements: false,
-    connectTimeout: 8000, // ✅ pra não travar demais quando não tem DB
-  });
-
-  return pool;
-}
-
-async function ensureSchema(pool) {
-  const sql = `
-CREATE TABLE IF NOT EXISTS pauta_processos (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  geradoEm DATETIME(3) NOT NULL,
-  vara VARCHAR(255) NOT NULL,
-  dataBR VARCHAR(10) NOT NULL,
-  dataISO DATE NOT NULL,
-  numeroProcesso VARCHAR(64) NOT NULL,
-  sessao VARCHAR(255) NULL,
-  juiz VARCHAR(255) NULL,
-  reclamante VARCHAR(255) NULL,
-  reclamada VARCHAR(255) NULL,
-  createdAt TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  UNIQUE KEY uq_pauta (vara, dataISO, numeroProcesso),
-  KEY ix_data (dataISO),
-  KEY ix_vara (vara)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-`;
-  await pool.query(sql);
-}
-
-async function initDbIfEnabled() {
-  const enabled = isTrue(getEnv('DB_ENABLED', 'false'));
-
-  if (!enabled) {
-    console.log('ℹ️ DB_ENABLED=false -> rodando sem MySQL (só CSV/XLSX/email).');
+async function inicializarBanco() {
+  if (!isTrue(getEnv("DB_ENABLED", "false"))) {
+    console.log("ℹ️  DB_ENABLED=false → rodando sem MySQL.");
     return null;
   }
 
   let pool = null;
-
   try {
-    pool = await openDb();
+    pool = mysql.createPool({
+      host: getEnv("DB_HOST", "127.0.0.1"),
+      port: Number(getEnv("DB_PORT", "3306")),
+      user: getEnv("DB_USER", "root"),
+      password: getEnv("DB_PASS", ""),
+      database: getEnv("DB_NAME", "jte"),
+      waitForConnections: true,
+      connectionLimit: 10,
+      connectTimeout: 8000,
+    });
 
-    // ✅ força conexão (pega ECONNREFUSED aqui e não no meio do código)
-    await pool.query('SELECT 1');
+    await pool.query("SELECT 1");
 
-    await ensureSchema(pool);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS processos_sem_polo_passivo (
+        id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        geradoEm         DATETIME(3)     NOT NULL,
+        vara             VARCHAR(255)    NOT NULL,
+        dataBR           VARCHAR(10)     NOT NULL,
+        dataISO          DATE            NOT NULL,
+        numeroProcesso   VARCHAR(64)     NOT NULL,
+        sessao           VARCHAR(255)    NULL,
+        juiz             VARCHAR(255)    NULL,
+        reclamante       VARCHAR(255)    NULL,
+        createdAt        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_proc (vara, dataISO, numeroProcesso),
+        KEY ix_data (dataISO),
+        KEY ix_vara (vara(100))
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
 
-    console.log('✅ MySQL conectado e schema OK');
+    console.log("✅ MySQL conectado e schema OK");
     return pool;
   } catch (err) {
     console.warn(
-      `⚠️ MySQL indisponível (seguindo sem DB): ${err.code || ''} ${err.message || err}`
+      `⚠️  MySQL indisponível (${err.code || err.message}) → seguindo sem DB.`,
     );
-    try { if (pool) await pool.end(); } catch { }
+    try {
+      if (pool) await pool.end();
+    } catch {}
     return null;
   }
 }
 
-function brToIsoDateString(br) {
-  const d = parseBRDate(br);
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-async function insertRowsMySql(pool, rows, chunkSize = 800) {
-  if (!pool) return { insertedOrUpdated: 0 };
-  if (!rows || rows.length === 0) return { insertedOrUpdated: 0 };
-
-  let total = 0;
-
-  for (let i = 0; i < rows.length; i += chunkSize) {
-    const chunk = rows.slice(i, i + chunkSize);
-
-    const values = [];
-    const placeholders = chunk.map((r) => {
-      const dataISO = brToIsoDateString(r.data);
-      values.push(
-        new Date(r.geradoEm),
-        r.vara,
-        r.data,
-        dataISO,
-        r.numeroProcesso,
-        r.sessao ?? null,
-        r.juiz ?? null,
-        r.reclamante ?? null,
-        r.reclamada ?? null
-      );
-      return '(?,?,?,?,?,?,?,?,?)';
-    });
-
-    const sql = `
-INSERT INTO pauta_processos
-(geradoEm, vara, dataBR, dataISO, numeroProcesso, sessao, juiz, reclamante, reclamada)
-VALUES ${placeholders.join(',')}
-ON DUPLICATE KEY UPDATE
-  geradoEm = VALUES(geradoEm),
-  sessao = VALUES(sessao),
-  juiz = VALUES(juiz),
-  reclamante = VALUES(reclamante),
-  reclamada = VALUES(reclamada)
-`;
-    const [res] = await pool.query(sql, values);
-    total += Number(res.affectedRows || 0);
+async function salvarNoBanco(pool, geradoEm, vara, dataBR, processo) {
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO processos_sem_polo_passivo
+         (geradoEm, vara, dataBR, dataISO, numeroProcesso, sessao, juiz, reclamante)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         geradoEm   = VALUES(geradoEm),
+         sessao     = VALUES(sessao),
+         juiz       = VALUES(juiz),
+         reclamante = VALUES(reclamante)`,
+      [
+        new Date(geradoEm),
+        vara,
+        dataBR,
+        brToIso(dataBR),
+        processo.numeroProcesso,
+        processo.sessao || null,
+        processo.juiz || null,
+        processo.reclamante || null,
+      ],
+    );
+  } catch (err) {
+    console.warn(
+      `⚠️  Erro ao salvar no banco (${processo.numeroProcesso}): ${err.message}`,
+    );
   }
-
-  return { insertedOrUpdated: total };
 }
 
-/* =========================
+/* ─────────────────────────────────────────
    XLSX
-========================= */
+───────────────────────────────────────── */
 
-async function writeXlsx(filePath, headers, rows) {
+async function gerarXLSX(filePath, rows) {
   const wb = new ExcelJS.Workbook();
-  wb.creator = 'JTe Bot';
+  wb.creator = "JTe Bot";
   wb.created = new Date();
 
-  const ws = wb.addWorksheet('Pauta');
+  const ws = wb.addWorksheet("Sem Polo Passivo");
+
+  const headers = [
+    "vara",
+    "data",
+    "numeroProcesso",
+    "sessao",
+    "juiz",
+    "reclamante",
+  ];
 
   ws.columns = headers.map((h) => ({
     header: h,
     key: h,
-    width: Math.max(12, Math.min(40, h.length + 6)),
+    width: Math.max(14, Math.min(55, h.length + 6)),
   }));
 
   for (const r of rows) ws.addRow(r);
@@ -263,21 +225,22 @@ async function writeXlsx(filePath, headers, rows) {
 
   for (let c = 1; c <= headers.length; c++) {
     let maxLen = String(headers[c - 1]).length;
-    ws.eachRow((row, rowNumber) => {
-      if (rowNumber === 1) return;
+    ws.eachRow((row, rowNum) => {
+      if (rowNum === 1) return;
       const v = row.getCell(c).value;
-      const s = (v === null || v === undefined) ? '' : String(v);
+      const s = v == null ? "" : String(v);
       if (s.length > maxLen) maxLen = s.length;
     });
-    ws.getColumn(c).width = Math.max(12, Math.min(60, maxLen + 2));
+    ws.getColumn(c).width = Math.max(14, Math.min(60, maxLen + 2));
   }
 
   await wb.xlsx.writeFile(filePath);
+  console.log(`📊 XLSX salvo: ${filePath} (${rows.length} linhas)`);
 }
 
-/* =========================
-   EMAIL (SMTP)
-========================= */
+/* ─────────────────────────────────────────
+   EMAIL
+───────────────────────────────────────── */
 
 function parseMailTo(value) {
   if (!value) return [];
@@ -287,19 +250,18 @@ function parseMailTo(value) {
     .filter(Boolean);
 }
 
-async function sendEmailWithAttachment({ subject, text, attachmentPath }) {
-  const host = getEnv('SMTP_HOST');
-  const port = Number(getEnv('SMTP_PORT', '587'));
-  const secure = String(getEnv('SMTP_SECURE', 'false')).toLowerCase() === 'true';
-  const user = getEnv('SMTP_USER');
-  const pass = getEnv('SMTP_PASS');
-  const from = getEnv('MAIL_FROM', user);
-  const to = parseMailTo(getEnv('MAIL_TO', ''));
+async function enviarEmailComAnexo(xlsxPath, totalProcessos) {
+  const host = getEnv("SMTP_HOST");
+  const port = Number(getEnv("SMTP_PORT", "587"));
+  const secure = isTrue(getEnv("SMTP_SECURE", "false"));
+  const user = getEnv("SMTP_USER");
+  const pass = getEnv("SMTP_PASS");
+  const from = getEnv("MAIL_FROM", user);
+  const to = parseMailTo(getEnv("MAIL_TO", ""));
 
-  if (!host || !user || !pass || !from || !to.length) {
-    throw new Error(
-      'Config SMTP incompleta. Verifique SMTP_HOST/SMTP_USER/SMTP_PASS/MAIL_FROM/MAIL_TO no env.'
-    );
+  if (!host || !user || !pass || !to.length) {
+    console.warn("⚠️  Config SMTP incompleta → e-mail não enviado.");
+    return;
   }
 
   const transporter = nodemailer.createTransport({
@@ -309,45 +271,55 @@ async function sendEmailWithAttachment({ subject, text, attachmentPath }) {
     auth: { user, pass },
   });
 
-  const info = await transporter.sendMail({
+  const hoje = new Date().toLocaleDateString("pt-BR");
+
+  await transporter.sendMail({
     from,
     to,
-    subject,
-    text,
-    attachments: [
-      {
-        filename: path.basename(attachmentPath),
-        path: attachmentPath,
-      },
-    ],
+    subject: `[JTe TRT-2] Processos sem Polo Passivo — ${hoje}`,
+    text: [
+      `Relatório gerado em ${hoje}.`,
+      ``,
+      `Total de processos sem polo passivo (ou sem advogado constituído): ${totalProcessos}`,
+      `Período: próximos 7 dias úteis`,
+      `Regional: São Paulo — Zonas Central, Norte e Oeste`,
+      ``,
+      `Arquivo XLSX em anexo.`,
+      ``,
+      `— Robô JTe`,
+    ].join("\n"),
+    attachments: [{ filename: path.basename(xlsxPath), path: xlsxPath }],
   });
 
-  return info;
+  console.log(`📧 E-mail enviado para: ${to.join(", ")}`);
 }
 
-/* =========================
-   OVERLAY & RETRY
-========================= */
+/* ─────────────────────────────────────────
+   BROWSER HELPERS
+───────────────────────────────────────── */
 
 async function fecharOverlays(page) {
   try {
-    const backdrop = page.locator('.cdk-overlay-backdrop');
-    await page.keyboard.press('Escape').catch(() => { });
+    await page.keyboard.press("Escape").catch(() => {});
     await page.waitForTimeout(200);
-
+    const backdrop = page.locator(".cdk-overlay-backdrop");
     if (await backdrop.isVisible({ timeout: 400 }).catch(() => false)) {
-      await backdrop.click({ position: { x: 5, y: 5 }, force: true }).catch(() => { });
+      await backdrop
+        .click({ position: { x: 5, y: 5 }, force: true })
+        .catch(() => {});
     }
-    await backdrop.waitFor({ state: 'detached', timeout: 1500 }).catch(() => { });
-  } catch { }
+    await backdrop
+      .waitFor({ state: "detached", timeout: 1500 })
+      .catch(() => {});
+  } catch {}
 }
 
-async function retryOperation(page, operation, maxRetries = 5, delayMs = 1200) {
+async function retryOp(page, fn, maxRetries = 5, delayMs = 1200) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await operation();
+      return await fn();
     } catch (err) {
-      console.warn(`⚠️ Tentativa ${attempt}/${maxRetries} falhou: ${err.message}`);
+      console.warn(`⚠️  Tentativa ${attempt}/${maxRetries}: ${err.message}`);
       if (attempt === maxRetries) throw err;
       await fecharOverlays(page);
       await page.waitForTimeout(delayMs);
@@ -355,119 +327,30 @@ async function retryOperation(page, operation, maxRetries = 5, delayMs = 1200) {
   }
 }
 
-/* =========================
-   NAVEGAÇÃO JTe
-========================= */
-
-async function abrirJTeSelecionarTRT2(page) {
-  console.log('➡️ Acessando JTe...');
-  await page.goto('https://jte.csjt.jus.br/start', { waitUntil: 'networkidle', timeout: 60000 });
-
-  await page.waitForLoadState('domcontentloaded');
-  await page.waitForTimeout(2500);
-
-  const locator = page.getByText('TRT2 - São Paulo', { exact: true });
-  await retryOperation(page, async () => {
-    await locator.waitFor({ state: 'visible', timeout: 20000 });
-    await locator.click({ force: true });
-  });
-
-  await page.waitForLoadState('networkidle');
-  await page.waitForTimeout(800);
-  console.log('✅ TRT2 selecionado');
-}
-
-async function abrirModuloPauta(page) {
-  console.log('➡️ Abrindo módulo Pauta...');
-  const card = page.locator('ion-card-content.card-content-modulo:has-text("Pauta")').first();
-  await retryOperation(page, async () => {
-    await card.waitFor({ state: 'visible', timeout: 20000 });
-    await card.click({ force: true });
-  });
-
-  await page.waitForLoadState('networkidle');
-  await page.waitForTimeout(800);
-  console.log('✅ Módulo Pauta aberto');
-}
-
-/* =========================
-   LISTAR VARAS
-========================= */
-
-async function listarVaras(page) {
-  console.log('➡️ Listando varas...');
-  const botaoUnidade = page.getByTestId('pautaButtonSelecaoUnidade');
-  await botaoUnidade.waitFor({ state: 'visible', timeout: 20000 });
-  await botaoUnidade.click({ force: true });
-
-  await page.waitForSelector('h1.tituloSelecaoTribunal:has-text("Órgão")', { timeout: 20000 });
-
-  const selectTipo = page.locator('mat-form-field[data-testid="selecaoTribunal"] mat-select');
-  await selectTipo.click();
-  await page.locator('mat-option:has-text("Audiências 1º grau")').first().click();
-  await page.waitForTimeout(200);
-
-  const selectMunicipio = page.locator('mat-form-field[data-testid="municipio"] mat-select');
-  await selectMunicipio.click();
-  await page.locator('.mat-mdc-select-panel mat-option:has-text("São Paulo - Zonas Central, Norte e Oeste")').click();
-  await page.waitForTimeout(200);
-
-  await page.waitForSelector('mat-form-field[data-testid="orgao"] mat-select[aria-disabled="false"]', { timeout: 20000 });
-
-  const selectOrgao = page.locator('mat-form-field[data-testid="orgao"] mat-select');
-  await selectOrgao.click();
-
-  const opcoes = page.locator('.mat-mdc-select-panel mat-option');
-  const total = await opcoes.count();
-
-  const varas = [];
-  for (let i = 0; i < total; i++) {
-    const label = await opcoes.nth(i).locator('.mdc-list-item__primary-text').textContent();
-    if (label) varas.push(label.trim());
-  }
-
-  await page.keyboard.press('Escape').catch(() => { });
-  await page.getByTestId('ButtonCancelar').click().catch(() => { });
-
-  console.log(`✅ ${varas.length} varas encontradas`);
-  return varas;
-}
-
-/* =========================
-   SELECIONAR UNIDADE
-========================= */
 function escapeRegExp(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function openMatSelect(page, selectLocator) {
-  await selectLocator.scrollIntoViewIfNeeded().catch(() => { });
+async function matSelectChoose(page, selectLocator, optionText, exact = true) {
+  await selectLocator.scrollIntoViewIfNeeded().catch(() => {});
   await selectLocator.click({ force: true });
 
-  const panel = page.locator('.mat-mdc-select-panel');
-  await panel.waitFor({ state: 'visible', timeout: 20000 });
-  return panel;
-}
+  const panel = page.locator(".mat-mdc-select-panel");
+  await panel.waitFor({ state: "visible", timeout: 20000 });
 
-async function clickMatOptionByText(page, text, opts) {
-  const panel = page.locator('.mat-mdc-select-panel');
-  await panel.waitFor({ state: 'visible', timeout: 20000 });
+  const pattern = exact
+    ? new RegExp(`^\\s*${escapeRegExp(optionText)}\\s*$`, "i")
+    : optionText;
 
-  const pattern = opts?.exact === false
-    ? text
-    : new RegExp(`^\\s*${escapeRegExp(text)}\\s*$`, 'i');
-
-  const option = panel.locator('mat-option').filter({ hasText: pattern }).first();
-  await option.waitFor({ state: 'visible', timeout: 20000 });
-  await option.scrollIntoViewIfNeeded().catch(() => { });
+  const option = panel
+    .locator("mat-option")
+    .filter({ hasText: pattern })
+    .first();
+  await option.waitFor({ state: "visible", timeout: 20000 });
+  await option.scrollIntoViewIfNeeded().catch(() => {});
   await option.click({ force: true });
 
-  await panel.waitFor({ state: 'hidden', timeout: 20000 }).catch(() => { });
-}
-
-async function matSelectChoose(page, selectLocator, optionText, opts) {
-  await openMatSelect(page, selectLocator);
-  await clickMatOptionByText(page, optionText, opts);
+  await panel.waitFor({ state: "hidden", timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(150);
 }
 
@@ -475,373 +358,772 @@ async function waitMatSelectEnabled(page, selector) {
   await page.waitForSelector(selector, { timeout: 20000 });
   const loc = page.locator(selector);
   await page.waitForFunction(
-    (el) => el.getAttribute('aria-disabled') !== 'true',
+    (el) => el.getAttribute("aria-disabled") !== "true",
     await loc.elementHandle(),
-    { timeout: 20000 }
+    { timeout: 20000 },
   );
 }
 
-async function selecionarUnidade(page, varaLabel) {
-  console.log(`\n🏛️ Selecionando vara: ${varaLabel}`);
+/* ─────────────────────────────────────────
+   DEBUG: salva HTML e innerText da página
+───────────────────────────────────────── */
 
-  await fecharOverlays(page);
+let debugContador = 0;
+const DEBUG_HABILITADO = isTrue(getEnv("DEBUG_HTML", "false"));
 
-  const botaoUnidade = page.getByTestId('pautaButtonSelecaoUnidade');
-  await botaoUnidade.waitFor({ state: 'visible', timeout: 20000 });
-  await botaoUnidade.click({ force: true });
+async function debugSalvarPagina(page, numeroProcesso, outDir) {
+  if (!DEBUG_HABILITADO && debugContador >= 3) return;
+  debugContador++;
 
-  await page.waitForSelector('h1.tituloSelecaoTribunal:has-text("Órgão")', { timeout: 20000 });
+  const slug = (numeroProcesso || "sem_numero").replace(/[^0-9]/g, "");
+  const base = path.join(outDir, `debug_${String(debugContador).padStart(2, "0")}_${slug}`);
 
-  const selectTipo = page.locator('mat-form-field[data-testid="selecaoTribunal"] mat-select');
-  await matSelectChoose(page, selectTipo, 'Audiências 1º grau', { exact: true });
+  // Salva HTML completo
+  try {
+    const html = await page.content();
+    fs.writeFileSync(base + ".html", html, "utf8");
+  } catch {}
 
-  const selectMunicipio = page.locator('mat-form-field[data-testid="municipio"] mat-select');
-  await matSelectChoose(page, selectMunicipio, 'São Paulo - Zonas Central, Norte e Oeste', { exact: true });
-
-  await waitMatSelectEnabled(page, 'mat-form-field[data-testid="orgao"] mat-select');
-
-  const selectOrgao = page.locator('mat-form-field[data-testid="orgao"] mat-select');
-  await matSelectChoose(page, selectOrgao, varaLabel, { exact: true });
-
-  const confirmar = page.getByTestId('ButtonConfirmar');
-  await confirmar.waitFor({ state: 'visible', timeout: 20000 });
-
-  await page.waitForFunction(
-    (el) => !el.hasAttribute('disabled') && el.getAttribute('aria-disabled') !== 'true',
-    await confirmar.elementHandle(),
-    { timeout: 20000 }
-  ).catch(() => { });
-
-  await confirmar.click({ delay: 80 }).catch(() => { });
-  await page.waitForLoadState('networkidle').catch(() => { });
-  await page.waitForTimeout(700);
-
-  const todayBR = getTodayBR();
-  console.log(`🔄 Tentando ajustar para hoje (sem calendário): ${todayBR}`);
-
-  const ok = await selecionarDataComConfirmacao(page, todayBR, 1);
-  if (ok) console.log(`✅ Ajustado para hoje`);
-  else console.warn(`⚠️ Não conseguiu ajustar para hoje (sem calendário). Seguindo mesmo assim.`);
+  // Salva texto visível (innerText) — muito mais fácil de ler
+  try {
+    const texto = await page.evaluate(() => document.body.innerText || "");
+    fs.writeFileSync(base + ".txt", texto, "utf8");
+    console.log(`🔍 Debug salvo: ${base}.txt`);
+  } catch {}
 }
 
-/* =========================
-   SELEÇÃO DE DATA (SEM CALENDÁRIO)
-========================= */
+/* ─────────────────────────────────────────
+   NAVEGAÇÃO JTe
+───────────────────────────────────────── */
 
-const BTN_NEXT_CSS = '#main-content > ng-component:nth-child(3) > ion-content > div > div > ion-grid > ion-row:nth-child(2) > ion-col:nth-child(3) > ion-button';
-const BTN_PREV_CSS = '#main-content > ng-component:nth-child(3) > ion-content > div > div > ion-grid > ion-row:nth-child(2) > ion-col:nth-child(1) > ion-button';
-const BTN_DATE_DISPLAY_XPATH = '//*[@id="main-content"]/ng-component[3]/ion-content/div/div/ion-grid/ion-row[2]/ion-col[2]/ion-button';
+async function abrirJTe(page) {
+  console.log("➡️  Acessando JTe...");
+  await page.goto("https://jte.csjt.jus.br/start", {
+    waitUntil: "networkidle",
+    timeout: 60000,
+  });
+  await page.waitForTimeout(2500);
+
+  // Tela de autenticação: clica em "Não" para acesso anônimo
+  try {
+    const seletores = [
+      page.getByRole("button", { name: /^não$/i }),
+      page.getByRole("button", { name: /não autenticar/i }),
+      page.getByRole("button", { name: /continuar sem/i }),
+      page.getByRole("button", { name: /acesso público/i }),
+      page.getByRole("button", { name: /acesso anônimo/i }),
+      page.locator("ion-button").filter({ hasText: /^não$/i }),
+      page.locator("button").filter({ hasText: /^não$/i }),
+    ];
+
+    for (const btn of seletores) {
+      if (await btn.isVisible({ timeout: 3000 }).catch(() => false)) {
+        console.log('🔒 Tela de autenticação detectada → clicando em "Não"');
+        await btn.click({ force: true });
+        await page.waitForLoadState("networkidle").catch(() => {});
+        await page.waitForTimeout(1000);
+        break;
+      }
+    }
+  } catch {}
+
+  await retryOp(page, async () => {
+    const loc = page.getByText("TRT2 - São Paulo", { exact: true });
+    await loc.waitFor({ state: "visible", timeout: 20000 });
+    await loc.click({ force: true });
+  });
+
+  await page.waitForLoadState("networkidle");
+  await page.waitForTimeout(800);
+  console.log("✅ TRT-2 selecionado");
+}
+
+async function abrirModuloPauta(page) {
+  console.log("➡️  Abrindo módulo Pauta...");
+  await retryOp(page, async () => {
+    const card = page
+      .locator('ion-card-content.card-content-modulo:has-text("Pauta")')
+      .first();
+    await card.waitFor({ state: "visible", timeout: 20000 });
+    await card.click({ force: true });
+  });
+  await page.waitForLoadState("networkidle");
+  await page.waitForTimeout(800);
+  console.log("✅ Módulo Pauta aberto");
+}
+
+/* ─────────────────────────────────────────
+   LISTAR VARAS
+───────────────────────────────────────── */
+
+async function listarVaras(page) {
+  console.log("➡️  Listando varas...");
+
+  const botao = page.getByTestId("pautaButtonSelecaoUnidade");
+  await botao.waitFor({ state: "visible", timeout: 20000 });
+  await botao.click({ force: true });
+
+  await page.waitForSelector('h1.tituloSelecaoTribunal:has-text("Órgão")', {
+    timeout: 20000,
+  });
+
+  await matSelectChoose(
+    page,
+    page.locator('mat-form-field[data-testid="selecaoTribunal"] mat-select'),
+    "Audiências 1º grau",
+  );
+
+  await matSelectChoose(
+    page,
+    page.locator('mat-form-field[data-testid="municipio"] mat-select'),
+    "São Paulo - Zonas Central, Norte e Oeste",
+  );
+
+  await waitMatSelectEnabled(
+    page,
+    'mat-form-field[data-testid="orgao"] mat-select',
+  );
+
+  const selectOrgao = page.locator(
+    'mat-form-field[data-testid="orgao"] mat-select',
+  );
+  await selectOrgao.click({ force: true });
+
+  const panel = page.locator(".mat-mdc-select-panel");
+  await panel.waitFor({ state: "visible", timeout: 20000 });
+  await page.waitForSelector(".mat-mdc-select-panel mat-option", {
+    timeout: 20000,
+  });
+
+  const opcoes = panel.locator("mat-option");
+  const total = await opcoes.count();
+  const varas = [];
+
+  for (let i = 0; i < total; i++) {
+    const label = await opcoes
+      .nth(i)
+      .locator(".mdc-list-item__primary-text")
+      .textContent()
+      .catch(() => "");
+    if (label && label.trim()) varas.push(label.trim());
+  }
+
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.getByTestId("ButtonCancelar").click().catch(() => {});
+
+  console.log(`✅ ${varas.length} varas encontradas`);
+  return varas;
+}
+
+/* ─────────────────────────────────────────
+   SELECIONAR UNIDADE (VARA)
+───────────────────────────────────────── */
+
+async function selecionarUnidade(page, varaLabel) {
+  console.log(`\n🏛️  Selecionando vara: ${varaLabel}`);
+  await fecharOverlays(page);
+
+  const botao = page.getByTestId("pautaButtonSelecaoUnidade");
+  await botao.waitFor({ state: "visible", timeout: 20000 });
+  await botao.click({ force: true });
+
+  await page.waitForSelector('h1.tituloSelecaoTribunal:has-text("Órgão")', {
+    timeout: 20000,
+  });
+
+  await matSelectChoose(
+    page,
+    page.locator('mat-form-field[data-testid="selecaoTribunal"] mat-select'),
+    "Audiências 1º grau",
+  );
+
+  await matSelectChoose(
+    page,
+    page.locator('mat-form-field[data-testid="municipio"] mat-select'),
+    "São Paulo - Zonas Central, Norte e Oeste",
+  );
+
+  await waitMatSelectEnabled(
+    page,
+    'mat-form-field[data-testid="orgao"] mat-select',
+  );
+
+  await matSelectChoose(
+    page,
+    page.locator('mat-form-field[data-testid="orgao"] mat-select'),
+    varaLabel,
+  );
+
+  const confirmar = page.getByTestId("ButtonConfirmar");
+  await confirmar.waitFor({ state: "visible", timeout: 20000 });
+  await confirmar.click({ delay: 80 }).catch(() => {});
+
+  await page.waitForLoadState("networkidle").catch(() => {});
+  await page.waitForTimeout(700);
+}
+
+/* ─────────────────────────────────────────
+   NAVEGAÇÃO DE DATAS (botões prev/next)
+───────────────────────────────────────── */
+
+const SEL_BTN_NEXT =
+  "#main-content > ng-component:nth-child(3) > ion-content > div > div > ion-grid > ion-row:nth-child(2) > ion-col:nth-child(3) > ion-button";
+const SEL_BTN_PREV =
+  "#main-content > ng-component:nth-child(3) > ion-content > div > div > ion-grid > ion-row:nth-child(2) > ion-col:nth-child(1) > ion-button";
+const XPATH_BTN_DATA =
+  '//*[@id="main-content"]/ng-component[3]/ion-content/div/div/ion-grid/ion-row[2]/ion-col[2]/ion-button';
 
 function extrairDataBR(texto) {
-  const raw = String(texto ?? '').trim();
-  const m = raw.match(/\b\d{2}\/\d{2}\/\d{4}\b/);
-  return m?.[0] ?? '';
+  const m = String(texto ?? "").match(/\b\d{2}\/\d{2}\/\d{4}\b/);
+  return m?.[0] ?? "";
 }
 
-async function clickIonButtonByCss(page, cssSel) {
+async function lerDataExibida(page) {
   try {
-    return await page.evaluate((sel) => {
-      const host = document.querySelector(sel);
+    const raw = await page.evaluate((xp) => {
+      const node = document.evaluate(
+        xp,
+        document,
+        null,
+        XPathResult.FIRST_ORDERED_NODE_TYPE,
+        null,
+      ).singleNodeValue;
+      if (!node) return "";
+      const btn =
+        node.shadowRoot?.querySelector("button") ||
+        node.querySelector?.("button");
+      return (
+        btn?.innerText ||
+        btn?.textContent ||
+        node.innerText ||
+        node.textContent ||
+        ""
+      ).trim();
+    }, XPATH_BTN_DATA);
+    if (raw) return raw;
+  } catch {}
+
+  try {
+    return (
+      await page
+        .getByTestId("pautaButtonData")
+        .innerText({ timeout: 800 })
+        .catch(() => "")
+    ).trim();
+  } catch {}
+
+  return "";
+}
+
+async function clicarBotaoIon(page, sel) {
+  return page
+    .evaluate((s) => {
+      const host = document.querySelector(s);
       if (!host) return false;
-      const btn = host.shadowRoot?.querySelector('button') || host.querySelector?.('button');
+      const btn =
+        host.shadowRoot?.querySelector("button") ||
+        host.querySelector?.("button");
       (btn || host).click();
       return true;
-    }, cssSel);
-  } catch {
-    return false;
-  }
+    }, sel)
+    .catch(() => false);
 }
 
-async function readIonButtonTextByXpath(page, xpath) {
-  try {
-    return await page.evaluate((xp) => {
-      const node = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-      if (!node) return '';
-      const btn = node.shadowRoot?.querySelector('button') || node.querySelector?.('button');
-      const txt = (btn?.innerText || btn?.textContent || node.innerText || node.textContent || '').trim();
-      return txt;
-    }, xpath);
-  } catch {
-    return '';
-  }
-}
+async function navegarParaData(page, alvoBR, maxSteps = 220) {
+  const alvoMs = parseBRDate(alvoBR).getTime();
 
-async function ionExistsByCss(page, cssSel) {
-  try {
-    return await page.evaluate((sel) => !!document.querySelector(sel), cssSel);
-  } catch {
-    return false;
-  }
-}
-
-async function lerTextoDataExibida(page) {
-  const raw = await readIonButtonTextByXpath(page, BTN_DATE_DISPLAY_XPATH);
-  if (raw) return raw;
-
-  try {
-    const t = await page.getByTestId('pautaButtonData').innerText({ timeout: 800 }).catch(() => '');
-    if (t && String(t).trim()) return String(t).trim();
-  } catch { }
-
-  return '';
-}
-
-async function esperarTextoMudar(page, anterior, timeoutMs = 2500) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const atual = await lerTextoDataExibida(page);
-    if (atual && atual !== anterior) return atual;
-    await page.waitForTimeout(80);
-  }
-  return await lerTextoDataExibida(page);
-}
-
-async function irAteDataPorBotoes(page, alvoBR, maxSteps = 180) {
-  await fecharOverlays(page);
-
-  const alvoDate = parseBRDate(alvoBR).getTime();
-
-  const hasPrev = await ionExistsByCss(page, BTN_PREV_CSS);
-  const hasNext = await ionExistsByCss(page, BTN_NEXT_CSS);
-  if (!hasNext && !hasPrev) {
-    console.warn('⚠️ Não achei botões prev/next para navegar datas.');
-    return false;
-  }
-
-  let raw = await lerTextoDataExibida(page);
-  if (raw && raw.includes(alvoBR)) return true;
-
-  for (let step = 1; step <= maxSteps; step++) {
-    raw = await lerTextoDataExibida(page);
+  for (let step = 0; step < maxSteps; step++) {
+    const raw = await lerDataExibida(page);
     if (raw && raw.includes(alvoBR)) return true;
 
     const atualBR = extrairDataBR(raw);
-    let direction = +1;
+    const atualMs = atualBR ? parseBRDate(atualBR).getTime() : 0;
 
-    if (atualBR) {
-      const atualDate = parseBRDate(atualBR).getTime();
-      if (hasPrev && atualDate > alvoDate) direction = -1;
-      else direction = +1;
-    } else {
-      direction = +1;
-    }
+    const irParaTras = atualMs && atualMs > alvoMs;
+    const antes = raw;
 
-    const antes = raw || '';
-    const clicked = direction === -1
-      ? await clickIonButtonByCss(page, BTN_PREV_CSS)
-      : await clickIonButtonByCss(page, BTN_NEXT_CSS);
+    const clicou = irParaTras
+      ? await clicarBotaoIon(page, SEL_BTN_PREV)
+      : await clicarBotaoIon(page, SEL_BTN_NEXT);
 
-    if (!clicked) {
-      console.warn(`⚠️ Falhou clique no botão ${direction === -1 ? 'PREV' : 'NEXT'} (step ${step}).`);
-      await page.waitForTimeout(150);
+    if (!clicou) {
+      await page.waitForTimeout(200);
       continue;
     }
 
-    const depois = await esperarTextoMudar(page, antes, 2500);
-    if (depois && String(depois).includes(alvoBR)) return true;
-
-    await page.waitForTimeout(120);
+    const inicio = Date.now();
+    while (Date.now() - inicio < 2500) {
+      const depois = await lerDataExibida(page);
+      if (depois && depois !== antes) {
+        if (depois.includes(alvoBR)) return true;
+        break;
+      }
+      await page.waitForTimeout(80);
+    }
   }
 
-  return false;
+  return (await lerDataExibida(page)).includes(alvoBR);
 }
 
-async function selecionarDataComConfirmacao(page, dataBR, maxTentativas = 3) {
+async function selecionarData(page, dataBR, maxTentativas = 3) {
   for (let t = 1; t <= maxTentativas; t++) {
-    const rawAntes = await lerTextoDataExibida(page);
-
-    const ok = await irAteDataPorBotoes(page, dataBR, 220);
-    const rawDepois = await lerTextoDataExibida(page);
-
-    console.log(`🧾 Data (tentativa ${t}/${maxTentativas}): antes="${rawAntes}" | depois="${rawDepois}" | alvo=${dataBR}`);
-
-    if (ok) return true;
-
-    console.warn(`⚠️ Não achou data via botões: ${dataBR}. Retentando...`);
     await fecharOverlays(page);
+    const ok = await navegarParaData(page, dataBR, 220);
+    if (ok) return true;
+    console.warn(`⚠️  Data não aplicou (${t}/${maxTentativas}): ${dataBR}`);
     await page.waitForTimeout(600);
   }
-
   return false;
 }
 
-/* =========================
-   ESPERAR PAUTA ESTABILIZAR
-========================= */
+/* ─────────────────────────────────────────
+   ESPERAR PAUTA CARREGAR
+───────────────────────────────────────── */
 
-async function esperarPautaEstabilizar(page) {
-  const spinners = [
-    page.locator('ion-spinner').first(),
-    page.locator('.mat-mdc-progress-spinner').first(),
-    page.locator('.mat-mdc-progress-bar').first(),
-  ];
-
-  for (const sp of spinners) {
+async function esperarPauta(page) {
+  for (const sel of [
+    "ion-spinner",
+    ".mat-mdc-progress-spinner",
+    ".mat-mdc-progress-bar",
+  ]) {
+    const sp = page.locator(sel).first();
     if (await sp.isVisible({ timeout: 300 }).catch(() => false)) {
-      await sp.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => { });
+      await sp.waitFor({ state: "hidden", timeout: 15000 }).catch(() => {});
     }
   }
 
   let last = -1;
   for (let i = 0; i < 20; i++) {
-    const count = await page.locator('ion-list ion-item').count().catch(() => 0);
-
+    const count = await page
+      .locator("ion-list ion-item")
+      .count()
+      .catch(() => 0);
     if (count === last) {
       await page.waitForTimeout(600);
-      const count2 = await page.locator('ion-list ion-item').count().catch(() => 0);
-      if (count2 === count) return;
+      const count2 = await page
+        .locator("ion-list ion-item")
+        .count()
+        .catch(() => 0);
+      if (count2 === count) return count;
     }
-
     last = count;
     await page.waitForTimeout(250);
   }
+
+  return last;
 }
 
-/* =========================
-   EXTRAÇÃO
-========================= */
+/* ─────────────────────────────────────────
+   EXTRAIR LISTA DA PAUTA
+───────────────────────────────────────── */
 
-async function extrairProcessosDaPauta(page) {
-  const count = await page.locator('ion-list ion-item').count().catch(() => 0);
-  if (!count) return [];
+async function extrairListaPauta(page) {
+  const total = await page
+    .locator("ion-list ion-item")
+    .count()
+    .catch(() => 0);
+  if (!total) return [];
 
-  const processos = await page.evaluate(() => {
-    const items = document.querySelectorAll('ion-list ion-item');
-    return Array.from(items).map((item) => {
-      const getText = (sel) => {
-        const el = item.querySelector(sel);
-        return el ? el.textContent.replace(/\u00a0/g, ' ').trim() : '';
-      };
+  return page.evaluate(() => {
+    return Array.from(document.querySelectorAll("ion-list ion-item")).map(
+      (item, idx) => {
+        const getText = (sel) => {
+          const el = item.querySelector(sel);
+          return el ? el.textContent.replace(/\u00a0/g, " ").trim() : "";
+        };
 
-      const hora = getText('.sessao');
-      const status = getText('.palavrasRight');
-      const numeroProcesso = getText('.JT-item-texto-negrito');
+        const partes = Array.from(
+          item.querySelectorAll(".item-desc-small.item-text-wrap"),
+        )
+          .map((e) => e.textContent.replace(/\u00a0/g, " ").trim())
+          .filter(Boolean);
 
-      const partes = Array.from(item.querySelectorAll('.item-desc-small.item-text-wrap'))
-        .map((e) => e.textContent.replace(/\u00a0/g, ' ').trim())
-        .filter(Boolean);
-
-      return {
-        numeroProcesso,
-        sessao: [hora, status].filter(Boolean).join(' - '),
-        juiz: partes[0] || '',
-        reclamante: partes[1] || '',
-        reclamada: partes[2] || '',
-      };
-    });
+        return {
+          idx,
+          numeroProcesso: getText(".JT-item-texto-negrito"),
+          sessao: [getText(".sessao"), getText(".palavrasRight")]
+            .filter(Boolean)
+            .join(" - "),
+          juiz: partes[0] || "",
+          reclamante: partes[1] || "",
+        };
+      },
+    );
   });
-
-  return processos;
 }
 
-/* =========================
+/* ─────────────────────────────────────────
+   VERIFICAR POLO PASSIVO SEM ADVOGADO
+   ─────────────────────────────────────────
+   Estratégia: usa innerText linha a linha para ser imune ao shadow DOM
+   dos Web Components Ionic (ion-*).
+
+   Retorna TRUE quando:
+   a) A página carregou E não existe nenhum "Polo passivo" listado, OU
+   b) Existe(m) polo(s) passivo(s) mas NENHUM deles tem advogado constituído
+      (campo "Advogado(s)" ausente, vazio, "-" ou "—")
+
+   Retorna FALSE (conservador) quando:
+   - A página não carregou corretamente
+   - Qualquer polo passivo tem advogado com nome preenchido
+   - Não foi possível localizar o campo Advogado(s) após o polo passivo
+     (evita falsos positivos por falha de parsing)
+───────────────────────────────────────── */
+
+async function verificarPoloPassivoSemAdvogado(page, outDir, numeroProcesso) {
+  try {
+    // Aguarda algum indicador de que a página de detalhes carregou
+    await page
+      .waitForSelector(
+        'h1, .processo-numero, [class*="numero"], .titulo-processo, ion-title',
+        { timeout: 30000 },
+      )
+      .catch(() => {});
+
+    // Tempo extra — o JTe carrega partes de forma assíncrona
+    await page.waitForTimeout(3000);
+
+    // Salva debug dos primeiros processos para inspeção manual
+    await debugSalvarPagina(page, numeroProcesso, outDir);
+
+    return await page.evaluate(() => {
+      // ── Coleta o texto visível completo da página ──
+      // innerText respeita visibilidade CSS e quebras de linha reais,
+      // sendo muito mais confiável que textContent para este caso.
+      const textoCompleto = (document.body.innerText || "").trim();
+
+      if (!textoCompleto) {
+        console.log("[JTe] Página vazia — ignorando");
+        return false;
+      }
+
+      const linhas = textoCompleto
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+
+      // ── Verifica se a página de detalhes realmente carregou ──
+      const paginaCarregou = linhas.some((l) =>
+        /polo\s+ativo|autuaç|classe|vara\s+do\s+trabalho|reclamante|número\s+do\s+processo/i.test(l),
+      );
+
+      if (!paginaCarregou) {
+        console.log("[JTe] Página não identificada como detalhes — ignorando");
+        return false;
+      }
+
+      // ── Verifica se existe polo passivo ──
+      const indicesPoloPassivo = [];
+      for (let i = 0; i < linhas.length; i++) {
+        if (/polo\s+passivo/i.test(linhas[i])) {
+          indicesPoloPassivo.push(i);
+        }
+      }
+
+      // Sem polo passivo algum → processo sem réu constituído
+      if (indicesPoloPassivo.length === 0) {
+        console.log("[JTe] Nenhum polo passivo encontrado → incluir");
+        return true;
+      }
+
+      // ── Para cada polo passivo, verifica o campo Advogado(s) ──
+      for (const idxPolo of indicesPoloPassivo) {
+        let encontrouCampoAdv = false;
+        let temAdvogado = false;
+
+        // Varre as próximas linhas até encontrar outro polo ou limite de 15 linhas
+        for (let j = idxPolo + 1; j < Math.min(idxPolo + 15, linhas.length); j++) {
+          const linha = linhas[j];
+
+          // Parou em outro bloco de polo → encerra busca para este polo
+          if (/^polo\s+(passivo|ativo)/i.test(linha)) break;
+
+          if (/^advogado/i.test(linha)) {
+            encontrouCampoAdv = true;
+
+            // O valor do advogado pode estar:
+            // (a) na mesma linha após "Advogado(s):" → "Advogado(s): João Silva"
+            // (b) na linha seguinte → linha j+1
+            const mesmaLinha = linha.replace(/^advogado\(s\)\s*:?\s*/i, "").trim();
+            const proximaLinha = linhas[j + 1] ?? "";
+
+            const valor = mesmaLinha || proximaLinha;
+
+            const vazio =
+              !valor ||
+              valor === "-" ||
+              valor === "—" ||
+              valor === "–" ||
+              /^advogado/i.test(valor); // próxima linha é outro campo
+
+            console.log(
+              `[JTe] Polo passivo[${idxPolo}] advogado="${valor}" vazio=${vazio}`,
+            );
+
+            if (!vazio) {
+              temAdvogado = true;
+            }
+            break;
+          }
+        }
+
+        // ── Decisão conservadora ──
+        // Se achou o campo e tem advogado → descartar processo
+        if (encontrouCampoAdv && temAdvogado) {
+          console.log("[JTe] Polo passivo COM advogado → descartar");
+          return false;
+        }
+
+        // Se NÃO encontrou o campo Advogado(s) após o polo passivo,
+        // não assume vazio — pode ser erro de parsing ou carregamento parcial.
+        // Retorna false para não gerar falso positivo.
+        if (!encontrouCampoAdv) {
+          console.log(
+            `[JTe] Campo Advogado(s) não encontrado após polo passivo[${idxPolo}] → descartar por segurança`,
+          );
+          return false;
+        }
+      }
+
+      // Chegou aqui: todos os polos passivos têm campo Advogado(s) vazio/"-"
+      console.log("[JTe] Todos os polos passivos SEM advogado → incluir");
+      return true;
+    });
+  } catch (err) {
+    console.warn(`⚠️  Erro ao verificar polo passivo: ${err.message}`);
+    return false;
+  }
+}
+
+/* ─────────────────────────────────────────
+   VOLTAR PARA A PAUTA
+───────────────────────────────────────── */
+
+async function voltarParaPauta(page) {
+  try {
+    const seletoresVoltar = [
+      page.locator("ion-back-button").first(),
+      page.locator('ion-toolbar ion-button[fill="clear"]').first(),
+      page.locator("ion-header ion-button").first(),
+    ];
+
+    for (const btn of seletoresVoltar) {
+      if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await btn.click({ force: true });
+        await page.waitForLoadState("networkidle").catch(() => {});
+        await page.waitForTimeout(1500);
+        return;
+      }
+    }
+  } catch {}
+
+  // Fallback: navegação nativa do browser
+  try {
+    await page.goBack({ waitUntil: "networkidle", timeout: 15000 });
+    await page.waitForTimeout(1500);
+  } catch {}
+}
+
+/* ─────────────────────────────────────────
    MAIN
-========================= */
+───────────────────────────────────────── */
 
 async function main() {
-
-  // ✅ DB pool (opcional)
-  const pool = await initDbIfEnabled();
-  const browser = await chromium.launch({ headless: false, slowMo: 100 });
-  const page = await browser.newPage();
-
   const geradoEm = new Date().toISOString();
-  const rowsCsv = [];
-  const headers = ['geradoEm', 'vara', 'data', 'numeroProcesso', 'sessao', 'juiz', 'reclamante', 'reclamada'];
+
+  // ── Saída
+  const outDir = path.join(process.cwd(), "output");
+  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+
+  const ts = Date.now();
+  const csvPath = path.join(outDir, `sem_polo_passivo_${ts}.csv`);
+  const xlsxPath = path.join(outDir, `sem_polo_passivo_${ts}.xlsx`);
+
+  // ── Banco
+  const pool = await inicializarBanco();
+
+  // ── Browser
+  const browser = await chromium.launch({ headless: false, slowMo: 80 });
+  const page = await browser.newPage();
+  page.setDefaultTimeout(60000);
+  page.setDefaultNavigationTimeout(60000);
+
+  // Captura logs do console do browser (útil para ver os [JTe] debug)
+  page.on("console", (msg) => {
+    if (msg.text().includes("[JTe]")) {
+      console.log(`   🖥️  ${msg.text()}`);
+    }
+  });
+
+  const resultados = [];
 
   try {
-    await abrirJTeSelecionarTRT2(page);
+    await abrirJTe(page);
     await abrirModuloPauta(page);
 
-    const varas = await listarVaras(page);
-    const varasAlvo = varas;
+    const todasVaras = await listarVaras(page);
+    const varas = todasVaras.slice(0, 3); // ← limita a 3 varas para teste
+    const datas = gerarDatasProximos7Dias();
 
-    const datas = gerarDatasProximosDoisMeses();
-    console.log(`📅 ${datas.length} datas alvo`);
+    console.log(
+      `\n🧪 MODO TESTE: usando ${varas.length}/${todasVaras.length} varas`,
+    );
+    console.log(`   Varas selecionadas: ${varas.join(" | ")}`);
+    console.log(
+      `\n🚀 Iniciando coleta: ${varas.length} varas × ${datas.length} dias úteis\n`,
+    );
 
-    for (const vara of varasAlvo) {
+    if (DEBUG_HABILITADO) {
+      console.log("🔍 DEBUG_HTML=true → salvando HTML/TXT dos primeiros processos em output/");
+    } else {
+      console.log("💡 Dica: defina DEBUG_HTML=true no .env para salvar HTML dos primeiros processos");
+    }
+
+    for (const vara of varas) {
       await selecionarUnidade(page, vara);
 
       for (const dataBR of datas) {
-        console.log(`📅 Procurando data (sem calendário): ${dataBR}`);
+        console.log(`\n📅 ${vara} | ${dataBR}`);
 
-        const ok = await selecionarDataComConfirmacao(page, dataBR, 2);
-        if (!ok) {
-          console.warn(`⚠️ Pulando data (não achou no header): ${vara} | ${dataBR}`);
+        const okData = await selecionarData(page, dataBR, 3);
+        if (!okData) {
+          console.warn(`⚠️  Pulando: data não aplicou (${dataBR})`);
           continue;
         }
 
-        await esperarPautaEstabilizar(page);
+        await page.waitForTimeout(2000);
+        const totalItens = await esperarPauta(page);
 
-        const processos = await extrairProcessosDaPauta(page);
-        console.log(`📌 ${vara} | ${dataBR} | ${processos.length} processos`);
-
-        for (const p of processos) {
-          rowsCsv.push({
-            geradoEm,
-            vara,
-            data: dataBR,
-            numeroProcesso: p.numeroProcesso,
-            sessao: p.sessao,
-            juiz: p.juiz,
-            reclamante: p.reclamante,
-            reclamada: p.reclamada,
-          });
+        if (!totalItens) {
+          console.log(`   (sem audiências)`);
+          continue;
         }
 
-        // ✅ grava em DB só se DB estiver OK
-        if (pool && processos.length) {
-          const rowsChunk = processos.map((p) => ({
-            geradoEm,
-            vara,
-            data: dataBR,
-            numeroProcesso: p.numeroProcesso,
-            sessao: p.sessao,
-            juiz: p.juiz,
-            reclamante: p.reclamante,
-            reclamada: p.reclamada,
-          }));
+        const processos = await extrairListaPauta(page);
+        console.log(`   📋 ${processos.length} processo(s) na pauta`);
 
-          const r = await insertRowsMySql(pool, rowsChunk, 800);
-          console.log(`💾 MySQL: affectedRows=${r.insertedOrUpdated} (insert/update)`);
+        for (let i = 0; i < processos.length; i++) {
+          const p = processos[i];
+          if (!p.numeroProcesso) continue;
+
+          try {
+            // Re-busca o item pelo índice para evitar referências stale
+            const items = page.locator("ion-list ion-item");
+            const item = items.nth(p.idx);
+
+            await item.scrollIntoViewIfNeeded().catch(() => {});
+
+            // Tenta clicar no botão de 3 pontos (⋮)
+            const menuBtn = item
+              .locator(
+                'ion-button[slot="end"], ion-button.more-button, ion-button:last-of-type',
+              )
+              .first();
+
+            const menuBtnVisivel = await menuBtn
+              .isVisible({ timeout: 1000 })
+              .catch(() => false);
+
+            if (menuBtnVisivel) {
+              await menuBtn.click({ force: true });
+            } else {
+              await item.click({ force: true });
+            }
+
+            // Aguarda menu contextual e clica em "Detalhes do processo"
+            const detalhesOpcao = page
+              .locator("text=Detalhes do processo")
+              .first();
+            const menuAbriu = await detalhesOpcao
+              .isVisible({ timeout: 4000 })
+              .catch(() => false);
+
+            if (menuAbriu) {
+              await detalhesOpcao.click({ force: true });
+            }
+
+            await page.waitForTimeout(2000);
+            await page.waitForLoadState("networkidle").catch(() => {});
+
+            // Passa outDir e número do processo para permitir debug
+            const semAdvogado = await verificarPoloPassivoSemAdvogado(
+              page,
+              outDir,
+              p.numeroProcesso,
+            );
+
+            if (semAdvogado) {
+              console.log(
+                `   ✅ Polo passivo SEM advogado → ${p.numeroProcesso}`,
+              );
+
+              const registro = {
+                vara,
+                data: dataBR,
+                numeroProcesso: p.numeroProcesso,
+                sessao: p.sessao,
+                juiz: p.juiz,
+                reclamante: p.reclamante,
+              };
+
+              resultados.push(registro);
+              await salvarNoBanco(pool, geradoEm, vara, dataBR, p);
+            } else {
+              console.log(
+                `   — ${p.numeroProcesso} (polo passivo com advogado ou parsing inconclusivo)`,
+              );
+            }
+
+            await voltarParaPauta(page);
+            await page.waitForTimeout(1000 + Math.floor(Math.random() * 800));
+
+          } catch (err) {
+            console.warn(
+              `   ⚠️  Erro no processo ${p.numeroProcesso}: ${err.message}`,
+            );
+            await voltarParaPauta(page);
+            await page.waitForTimeout(2000);
+          }
         }
       }
     }
 
-    const outDir = path.join(process.cwd(), 'output');
-    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+    // ── Salvar resultados ──
+    console.log(`\n📦 Total sem polo passivo: ${resultados.length}`);
 
-    const stamp = Date.now();
-    const csvPath = path.join(outDir, `pauta_trt2_2meses_${stamp}.csv`);
-    const xlsxPath = path.join(outDir, `pauta_trt2_2meses_${stamp}.xlsx`);
+    const headers = [
+      "vara",
+      "data",
+      "numeroProcesso",
+      "sessao",
+      "juiz",
+      "reclamante",
+    ];
+    writeCsv(csvPath, headers, resultados);
+    await gerarXLSX(xlsxPath, resultados);
+    await enviarEmailComAnexo(xlsxPath, resultados.length);
 
-    writeCsv(csvPath, headers, rowsCsv);
-    await writeXlsx(xlsxPath, headers, rowsCsv);
+    console.log("\n✅ Execução concluída com sucesso!");
 
-    console.log(`\n✅ Concluído! ${rowsCsv.length} linhas`);
-    console.log(`📄 CSV:  ${csvPath}`);
-    console.log(`📊 XLSX: ${xlsxPath}`);
-
-    const subject = `Pauta TRT2 (2 meses) - ${new Date().toLocaleString('pt-BR')}`;
-    const text =
-      `Olá!\n\n` +
-      `Segue em anexo o arquivo XLSX com a extração da pauta do TRT2 para os próximos ~2 meses.\n\n` +
-      `Total de linhas: ${rowsCsv.length}\n` +
-      `Gerado em: ${geradoEm}\n\n` +
-      `Atenciosamente,\nRobô JTe`;
-
-    const info = await sendEmailWithAttachment({
-      subject,
-      text,
-      attachmentPath: xlsxPath,
-    });
-
-    console.log(`📧 Email enviado! messageId=${info.messageId || '(sem id)'}`);
   } catch (err) {
-    console.error('❌ Erro:', err);
+    console.error("❌ Erro fatal:", err);
+
+    if (resultados.length > 0) {
+      const headers = [
+        "vara",
+        "data",
+        "numeroProcesso",
+        "sessao",
+        "juiz",
+        "reclamante",
+      ];
+      writeCsv(csvPath, headers, resultados);
+      await gerarXLSX(xlsxPath, resultados).catch(() => {});
+      console.log(`💾 Parcial salvo: ${resultados.length} registros`);
+    }
   } finally {
-    try { if (pool) await pool.end(); } catch { }
-    // await browser.close().catch(() => {});
+    if (pool) await pool.end().catch(() => {});
+    await browser.close().catch(() => {});
   }
 }
 
