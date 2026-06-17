@@ -3,6 +3,30 @@ const fs = require('fs');
 const path = require('path');
 
 /* =========================
+   LOGGING
+========================= */
+
+const LOG_DIR = path.join(process.cwd(), 'output');
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+
+const logStream = fs.createWriteStream(
+  path.join(LOG_DIR, `log_${Date.now()}.txt`),
+  { flags: 'a' }
+);
+
+function log(msg) {
+  const line = `[${new Date().toISOString()}] ${msg}`;
+  console.log(line);
+  logStream.write(line + '\n');
+}
+
+function warn(msg) {
+  const line = `[${new Date().toISOString()}] WARN: ${msg}`;
+  console.warn(line);
+  logStream.write(line + '\n');
+}
+
+/* =========================
    CSV HELPERS
 ========================= */
 
@@ -13,14 +37,29 @@ function csvEscape(value) {
   return s;
 }
 
-function writeCsv(filePath, headers, rows) {
-  const bom = '\uFEFF';
+const CSV_HEADERS = ['geradoEm', 'vara', 'data', 'numeroProcesso', 'sessao', 'juiz', 'reclamante', 'reclamada'];
+
+function writeCsv(filePath, rows) {
+  const bom = '﻿';
   const lines = [];
-  lines.push(headers.map(csvEscape).join(';'));
+  lines.push(CSV_HEADERS.map(csvEscape).join(';'));
   for (const row of rows) {
-    lines.push(headers.map((h) => csvEscape(row[h])).join(';'));
+    lines.push(CSV_HEADERS.map((h) => csvEscape(row[h])).join(';'));
   }
   fs.writeFileSync(filePath, bom + lines.join('\n'), 'utf8');
+}
+
+function appendCsvRows(filePath, rows) {
+  const fileExists = fs.existsSync(filePath);
+  const lines = [];
+  if (!fileExists) {
+    const bom = '﻿';
+    lines.push(bom + CSV_HEADERS.map(csvEscape).join(';'));
+  }
+  for (const row of rows) {
+    lines.push(CSV_HEADERS.map((h) => csvEscape(row[h])).join(';'));
+  }
+  fs.appendFileSync(filePath, (fileExists ? '\n' : '') + lines.join('\n'), 'utf8');
 }
 
 /* =========================
@@ -78,13 +117,15 @@ async function fecharOverlays(page) {
   try {
     const backdrop = page.locator('.cdk-overlay-backdrop');
     await page.keyboard.press('Escape').catch(() => {});
-    await page.waitForTimeout(200);
+    await backdrop.waitFor({ state: 'detached', timeout: 1500 }).catch(() => {});
 
     if (await backdrop.isVisible({ timeout: 400 }).catch(() => false)) {
       await backdrop.click({ position: { x: 5, y: 5 }, force: true }).catch(() => {});
     }
     await backdrop.waitFor({ state: 'detached', timeout: 1500 }).catch(() => {});
-  } catch {}
+  } catch (err) {
+    warn(`fecharOverlays: ${err.message}`);
+  }
 }
 
 async function retryOperation(page, operation, maxRetries = 5, delayMs = 1200) {
@@ -92,7 +133,7 @@ async function retryOperation(page, operation, maxRetries = 5, delayMs = 1200) {
     try {
       return await operation();
     } catch (err) {
-      console.warn(`⚠️ Tentativa ${attempt}/${maxRetries} falhou: ${err.message}`);
+      warn(`Tentativa ${attempt}/${maxRetries} falhou: ${err.message}`);
       if (attempt === maxRetries) throw err;
       await fecharOverlays(page);
       await page.waitForTimeout(delayMs);
@@ -101,46 +142,10 @@ async function retryOperation(page, operation, maxRetries = 5, delayMs = 1200) {
 }
 
 /* =========================
-   NAVEGAÇÃO JTe
+   SELEÇÃO DE FILTROS (compartilhada)
 ========================= */
 
-async function abrirJTeSelecionarTRT2(page) {
-  console.log('➡️ Acessando JTe...');
-  await page.goto('https://jte.csjt.jus.br/start', { waitUntil: 'networkidle', timeout: 60000 });
-
-  await page.waitForLoadState('domcontentloaded');
-  await page.waitForTimeout(2500);
-
-  const locator = page.getByText('TRT2 - São Paulo', { exact: true });
-  await retryOperation(page, async () => {
-    await locator.waitFor({ state: 'visible', timeout: 20000 });
-    await locator.click({ force: true });
-  });
-
-  await page.waitForLoadState('networkidle');
-  await page.waitForTimeout(800);
-  console.log('✅ TRT2 selecionado');
-}
-
-async function abrirModuloPauta(page) {
-  console.log('➡️ Abrindo módulo Pauta...');
-  const card = page.locator('ion-card-content.card-content-modulo:has-text("Pauta")').first();
-  await retryOperation(page, async () => {
-    await card.waitFor({ state: 'visible', timeout: 20000 });
-    await card.click({ force: true });
-  });
-
-  await page.waitForLoadState('networkidle');
-  await page.waitForTimeout(800);
-  console.log('✅ Módulo Pauta aberto');
-}
-
-/* =========================
-   LISTAR VARAS
-========================= */
-
-async function listarVaras(page) {
-  console.log('➡️ Listando varas...');
+async function abrirPainelEFiltrar(page) {
   const botaoUnidade = page.getByTestId('pautaButtonSelecaoUnidade');
   await botaoUnidade.waitFor({ state: 'visible', timeout: 20000 });
   await botaoUnidade.click({ force: true });
@@ -150,16 +155,57 @@ async function listarVaras(page) {
   const selectTipo = page.locator('mat-form-field[data-testid="selecaoTribunal"] mat-select');
   await selectTipo.click();
   await page.locator('mat-option:has-text("Audiências 1º grau")').first().click();
-  await page.waitForTimeout(200);
+  await page.waitForLoadState('networkidle').catch(() => {});
 
   const selectMunicipio = page.locator('mat-form-field[data-testid="municipio"] mat-select');
   await selectMunicipio.click();
   await page.locator('.mat-mdc-select-panel mat-option:has-text("São Paulo - Zonas Central, Norte e Oeste")').click();
-  await page.waitForTimeout(200);
+  await page.waitForLoadState('networkidle').catch(() => {});
 
   await page.waitForSelector('mat-form-field[data-testid="orgao"] mat-select[aria-disabled="false"]', { timeout: 20000 });
 
-  const selectOrgao = page.locator('mat-form-field[data-testid="orgao"] mat-select');
+  return page.locator('mat-form-field[data-testid="orgao"] mat-select');
+}
+
+/* =========================
+   NAVEGAÇÃO JTe
+========================= */
+
+async function abrirJTeSelecionarTRT2(page) {
+  log('Acessando JTe...');
+  await page.goto('https://jte.csjt.jus.br/start', { waitUntil: 'networkidle', timeout: 60000 });
+  await page.waitForLoadState('domcontentloaded');
+
+  const locator = page.getByText('TRT2 - São Paulo', { exact: true });
+  await retryOperation(page, async () => {
+    await locator.waitFor({ state: 'visible', timeout: 20000 });
+    await locator.click({ force: true });
+  });
+
+  await page.waitForLoadState('networkidle');
+  log('TRT2 selecionado');
+}
+
+async function abrirModuloPauta(page) {
+  log('Abrindo módulo Pauta...');
+  const card = page.locator('ion-card-content.card-content-modulo:has-text("Pauta")').first();
+  await retryOperation(page, async () => {
+    await card.waitFor({ state: 'visible', timeout: 20000 });
+    await card.click({ force: true });
+  });
+
+  await page.waitForLoadState('networkidle');
+  log('Módulo Pauta aberto');
+}
+
+/* =========================
+   LISTAR VARAS
+========================= */
+
+async function listarVaras(page) {
+  log('Listando varas...');
+
+  const selectOrgao = await abrirPainelEFiltrar(page);
   await selectOrgao.click();
 
   const opcoes = page.locator('.mat-mdc-select-panel mat-option');
@@ -174,7 +220,7 @@ async function listarVaras(page) {
   await page.keyboard.press('Escape').catch(() => {});
   await page.getByTestId('ButtonCancelar').click().catch(() => {});
 
-  console.log(`✅ ${varas.length} varas encontradas`);
+  log(`${varas.length} varas encontradas`);
   return varas;
 }
 
@@ -183,28 +229,11 @@ async function listarVaras(page) {
 ========================= */
 
 async function selecionarUnidade(page, varaLabel) {
-  console.log(`\n🏛️ Selecionando vara: ${varaLabel}`);
+  log(`Selecionando vara: ${varaLabel}`);
 
   await fecharOverlays(page);
 
-  const botaoUnidade = page.getByTestId('pautaButtonSelecaoUnidade');
-  await botaoUnidade.click({ force: true });
-
-  await page.waitForSelector('h1.tituloSelecaoTribunal:has-text("Órgão")', { timeout: 20000 });
-
-  const selectTipo = page.locator('mat-form-field[data-testid="selecaoTribunal"] mat-select');
-  await selectTipo.click();
-  await page.locator('mat-option:has-text("Audiências 1º grau")').first().click();
-  await page.waitForTimeout(200);
-
-  const selectMunicipio = page.locator('mat-form-field[data-testid="municipio"] mat-select');
-  await selectMunicipio.click();
-  await page.locator('.mat-mdc-select-panel mat-option:has-text("São Paulo - Zonas Central, Norte e Oeste")').click();
-  await page.waitForTimeout(200);
-
-  await page.waitForSelector('mat-form-field[data-testid="orgao"] mat-select[aria-disabled="false"]', { timeout: 20000 });
-
-  const selectOrgao = page.locator('mat-form-field[data-testid="orgao"] mat-select');
+  const selectOrgao = await abrirPainelEFiltrar(page);
   await selectOrgao.click();
 
   const opcao = page.locator('.mat-mdc-select-panel mat-option').filter({ hasText: varaLabel }).first();
@@ -212,20 +241,16 @@ async function selecionarUnidade(page, varaLabel) {
 
   await page.getByTestId('ButtonConfirmar').click({ delay: 80 }).catch(() => {});
   await page.waitForLoadState('networkidle');
-  await page.waitForTimeout(700);
 
-  // Reset para hoje
   const todayBR = getTodayBR();
-  console.log(`🔄 Resetando para data de hoje: ${todayBR}`);
+  log(`Resetando para data de hoje: ${todayBR}`);
   const ok = await selecionarDataComConfirmacao(page, todayBR, 3);
-  if (ok) console.log(`✅ Reset para hoje bem-sucedido`);
-  else console.warn(`⚠️ Não conseguiu resetar para hoje. Seguindo mesmo assim.`);
+  if (ok) log('Reset para hoje bem-sucedido');
+  else warn('Não conseguiu resetar para hoje. Seguindo mesmo assim.');
 }
 
 /* =========================
-   SELEÇÃO DE DATA (JTe ROBUSTA)
-   - header tolerante (mês abreviado)
-   - aria-label pode estar no TD ou no BUTTON
+   SELEÇÃO DE DATA
 ========================= */
 
 function sameMonthYear(a, b) {
@@ -269,7 +294,6 @@ async function navegarParaMes(page, targetDate, maxSteps = 36) {
     const approx = await getCalendarHeaderDateApprox(page);
 
     if (!approx) {
-      // se não conseguir ler header, tenta ir pra frente e segue
       await nextBtn.click({ force: true }).catch(() => {});
       await page.waitForTimeout(120);
       continue;
@@ -297,7 +321,6 @@ async function clicarDiaNoCalendario(page, targetDate) {
     const cal = document.querySelector('mat-calendar');
     if (!cal) return false;
 
-    // 1) td com aria-label
     const tds = Array.from(cal.querySelectorAll('td.mat-calendar-body-cell[aria-label]'));
     for (const td of tds) {
       const aria = (td.getAttribute('aria-label') || '').trim();
@@ -309,7 +332,6 @@ async function clicarDiaNoCalendario(page, targetDate) {
       }
     }
 
-    // 2) button com aria-label
     const btns = Array.from(cal.querySelectorAll('td.mat-calendar-body-cell button[aria-label]'));
     for (const btn of btns) {
       const aria = (btn.getAttribute('aria-label') || '').trim();
@@ -320,7 +342,6 @@ async function clicarDiaNoCalendario(page, targetDate) {
       }
     }
 
-    // 3) fallback por texto do dia (não disabled)
     const any = Array.from(cal.querySelectorAll('td.mat-calendar-body-cell:not(.mat-calendar-body-disabled)'));
     for (const td of any) {
       const txt = (td.textContent || '').trim();
@@ -349,7 +370,7 @@ async function selecionarDataNoCalendario(page, dataBR) {
   await page.waitForSelector('mat-calendar', { timeout: 15000 });
 
   const okMes = await navegarParaMes(page, targetDate, 36);
-  if (!okMes) console.warn('⚠️ Não consegui navegar até o mês alvo. Tentando clicar o dia mesmo assim...');
+  if (!okMes) warn('Não consegui navegar até o mês alvo. Tentando clicar o dia mesmo assim...');
 
   const okDia = await clicarDiaNoCalendario(page, targetDate);
 
@@ -364,17 +385,17 @@ async function selecionarDataComConfirmacao(page, dataBR, maxTentativas = 3) {
     const okClique = await selecionarDataNoCalendario(page, dataBR);
 
     if (!okClique) {
-      console.warn(`⚠️ [${t}/${maxTentativas}] Clique no calendário falhou para ${dataBR}`);
+      warn(`[${t}/${maxTentativas}] Clique no calendário falhou para ${dataBR}`);
       await page.waitForTimeout(500);
       continue;
     }
 
     const dataVisivel = (await page.getByTestId('pautaButtonData').innerText().catch(() => '')).trim();
-    console.log(`🧾 Data visível no botão: ${dataVisivel} | alvo: ${dataBR}`);
+    log(`Data visível no botão: ${dataVisivel} | alvo: ${dataBR}`);
 
     if (dataVisivel === dataBR) return true;
 
-    console.warn(`⚠️ [${t}/${maxTentativas}] Data NÃO aplicou (visível=${dataVisivel}). Retentando...`);
+    warn(`[${t}/${maxTentativas}] Data NÃO aplicou (visível=${dataVisivel}). Retentando...`);
     await page.waitForTimeout(700);
   }
 
@@ -426,7 +447,7 @@ async function extrairProcessosDaPauta(page) {
     return Array.from(items).map((item) => {
       const getText = (sel) => {
         const el = item.querySelector(sel);
-        return el ? el.textContent.replace(/\u00a0/g, ' ').trim() : '';
+        return el ? el.textContent.replace(/ /g, ' ').trim() : '';
       };
 
       const hora = getText('.sessao');
@@ -434,7 +455,7 @@ async function extrairProcessosDaPauta(page) {
       const numeroProcesso = getText('.JT-item-texto-negrito');
 
       const partes = Array.from(item.querySelectorAll('.item-desc-small.item-text-wrap'))
-        .map((e) => e.textContent.replace(/\u00a0/g, ' ').trim())
+        .map((e) => e.textContent.replace(/ /g, ' ').trim())
         .filter(Boolean);
 
       return {
@@ -458,40 +479,45 @@ async function main() {
   const browser = await chromium.launch({ headless: false, slowMo: 100 });
   const page = await browser.newPage();
 
-  const geradoEm = new Date().toISOString();
-  const rowsCsv = [];
-  const headers = ['geradoEm', 'vara', 'data', 'numeroProcesso', 'sessao', 'juiz', 'reclamante', 'reclamada'];
+  const outDir = path.join(process.cwd(), 'output');
+  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+  const csvPath = path.join(outDir, `pauta_trt2_2meses_${Date.now()}.csv`);
+
+  let totalRows = 0;
 
   try {
     await abrirJTeSelecionarTRT2(page);
     await abrirModuloPauta(page);
 
     const varas = await listarVaras(page);
-    const varasAlvo = varas; // para teste: varas.slice(0, 5)
+    const varasAlvo = varas;
 
     const datas = gerarDatasProximosDoisMeses();
-    console.log(`📅 ${datas.length} datas alvo`);
+    log(`${datas.length} datas alvo`);
 
-    for (const vara of varasAlvo) {
+    for (let vi = 0; vi < varasAlvo.length; vi++) {
+      const vara = varasAlvo[vi];
       await selecionarUnidade(page, vara);
 
+      const varaRows = [];
+
       for (const dataBR of datas) {
-        console.log(`📅 Selecionando data: ${dataBR}`);
+        log(`[${vi + 1}/${varasAlvo.length}] ${vara} | ${dataBR}`);
 
         const ok = await selecionarDataComConfirmacao(page, dataBR, 3);
         if (!ok) {
-          console.warn(`⚠️ Pulando data (não aplicou): ${vara} | ${dataBR}`);
+          warn(`Pulando data (não aplicou): ${vara} | ${dataBR}`);
           continue;
         }
 
         await esperarPautaEstabilizar(page);
 
         const processos = await extrairProcessosDaPauta(page);
-        console.log(`📌 ${vara} | ${dataBR} | ${processos.length} processos`);
+        log(`${vara} | ${dataBR} | ${processos.length} processos`);
 
         for (const p of processos) {
-          rowsCsv.push({
-            geradoEm,
+          varaRows.push({
+            geradoEm: new Date().toISOString(),
             vara,
             data: dataBR,
             numeroProcesso: p.numeroProcesso,
@@ -502,19 +528,21 @@ async function main() {
           });
         }
       }
+
+      if (varaRows.length > 0) {
+        appendCsvRows(csvPath, varaRows);
+        totalRows += varaRows.length;
+        log(`Vara "${vara}" salva (${varaRows.length} linhas, total acumulado: ${totalRows})`);
+      }
     }
 
-    const outDir = path.join(process.cwd(), 'output');
-    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-
-    const filePath = path.join(outDir, `pauta_trt2_2meses_${Date.now()}.csv`);
-    writeCsv(filePath, headers, rowsCsv);
-
-    console.log(`\n✅ Concluído! ${rowsCsv.length} linhas em ${filePath}`);
+    log(`Concluído! ${totalRows} linhas em ${csvPath}`);
   } catch (err) {
-    console.error('❌ Erro:', err);
+    log(`ERRO: ${err.message}`);
+    console.error(err);
   } finally {
-    // await browser.close().catch(() => {});
+    await browser.close().catch(() => {});
+    logStream.end();
   }
 }
 
