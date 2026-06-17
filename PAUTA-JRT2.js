@@ -37,7 +37,7 @@ function csvEscape(value) {
   return s;
 }
 
-const CSV_HEADERS = ['geradoEm', 'vara', 'data', 'numeroProcesso', 'sessao', 'juiz', 'reclamante', 'reclamada'];
+const CSV_HEADERS = ['geradoEm', 'vara', 'data', 'numeroProcesso', 'hora', 'status', 'juiz', 'reclamante', 'reclamada'];
 
 function writeCsv(filePath, rows) {
   const bom = '﻿';
@@ -241,12 +241,6 @@ async function selecionarUnidade(page, varaLabel) {
 
   await page.getByTestId('ButtonConfirmar').click({ delay: 80 }).catch(() => {});
   await page.waitForLoadState('networkidle');
-
-  const todayBR = getTodayBR();
-  log(`Resetando para data de hoje: ${todayBR}`);
-  const ok = await selecionarDataComConfirmacao(page, todayBR, 3);
-  if (ok) log('Reset para hoje bem-sucedido');
-  else warn('Não conseguiu resetar para hoje. Seguindo mesmo assim.');
 }
 
 /* =========================
@@ -460,7 +454,8 @@ async function extrairProcessosDaPauta(page) {
 
       return {
         numeroProcesso,
-        sessao: [hora, status].filter(Boolean).join(' - '),
+        hora,
+        status,
         juiz: partes[0] || '',
         reclamante: partes[1] || '',
         reclamada: partes[2] || '',
@@ -469,6 +464,19 @@ async function extrairProcessosDaPauta(page) {
   });
 
   return processos;
+}
+
+const STATUS_EXCLUIR = ['realizada', 'cancelada', 'adiada', 'suspensa', 'arquivada'];
+
+function filtrarProcessosAtivos(processos) {
+  const filtrados = processos.filter(p => {
+    const st = p.status.toLowerCase();
+    return !STATUS_EXCLUIR.some(excl => st.includes(excl));
+  });
+  if (filtrados.length < processos.length) {
+    log(`Filtrados ${processos.length - filtrados.length} processos com status passado/cancelado (de ${processos.length})`);
+  }
+  return filtrados;
 }
 
 /* =========================
@@ -512,8 +520,9 @@ async function main() {
 
         await esperarPautaEstabilizar(page);
 
-        const processos = await extrairProcessosDaPauta(page);
-        log(`${vara} | ${dataBR} | ${processos.length} processos`);
+        const processosRaw = await extrairProcessosDaPauta(page);
+        const processos = filtrarProcessosAtivos(processosRaw);
+        log(`${vara} | ${dataBR} | ${processos.length} processos (${processosRaw.length} brutos)`);
 
         for (const p of processos) {
           varaRows.push({
@@ -521,7 +530,8 @@ async function main() {
             vara,
             data: dataBR,
             numeroProcesso: p.numeroProcesso,
-            sessao: p.sessao,
+            hora: p.hora,
+            status: p.status,
             juiz: p.juiz,
             reclamante: p.reclamante,
             reclamada: p.reclamada,

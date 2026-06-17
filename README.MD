@@ -40,7 +40,11 @@ Arquitetura Atual (Fase 1)
 
 Saída: ./output/pauta_trt2_2meses_[timestamp].csv
 Formato CSV: separador `;` (compatível com Excel PT-BR). Abrir no Excel via importação ou clicar direto se o locale for pt-BR.
-Colunas: geradoEm, vara, data, numeroProcesso, sessao, juiz, reclamante, reclamada
+Colunas: geradoEm, vara, data, numeroProcesso, hora, status, juiz, reclamante, reclamada
+
+Filtros automáticos:
+- Processos com status "Realizada", "Cancelada", "Adiada", "Suspensa" ou "Arquivada" são descartados automaticamente
+- Apenas audiências futuras com status ativo (ex: "Designada") são incluídas no CSV
 
 Fase 2 – Enriquecimento PJe (Alto Impacto)
 A partir do numeroProcesso extraído do JTe:
