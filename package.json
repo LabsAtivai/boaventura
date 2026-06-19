@@ -1,7 +1,7 @@
 {
   "name": "boaventura",
   "version": "1.0.0",
-  "description": "automação de trt para cliente",
+  "description": "Scraper JTe TRT-2 — processos sem polo passivo com advogado",
   "homepage": "https://github.com/LabsAtivai/boaventura#readme",
   "bugs": {
     "url": "https://github.com/LabsAtivai/boaventura/issues"
@@ -16,14 +16,15 @@
   "main": "PAUTA-JRT2.js",
   "scripts": {
     "start": "node PAUTA-JRT2.js",
-    "dev": "nodemon PAUTA-JRT2.js",
-    "worker": "node index.js"
+    "dev": "HEADLESS=false node PAUTA-JRT2.js",
+    "worker": "node index.js",
+    "worker:queue": "node index.js --only-queue",
+    "worker:process": "node index.js --only-work"
   },
   "dependencies": {
+    "bullmq": "^5.79.0",
     "dotenv": "^17.2.3",
-    "exceljs": "^4.4.0",
     "mysql2": "^3.16.2",
-    "nodemailer": "^7.0.13",
     "playwright": "^1.58.0"
   },
   "devDependencies": {
