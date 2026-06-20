@@ -204,10 +204,10 @@ async function abrirJTeSelecionarTRT2(page) {
       }
     }
   } catch {}
-  const locator = page.getByText("TRT2 - São Paulo", { exact: true });
+  const trt2 = page.getByTestId("startListItemTribunal502");
   await retryOperation(page, async () => {
-    await locator.waitFor({ state: "visible", timeout: 20000 });
-    await locator.click({ force: true });
+    await trt2.waitFor({ state: "visible", timeout: 20000 });
+    await trt2.click({ force: true });
   });
   await page.waitForLoadState("networkidle");
   log("TRT2 selecionado");
