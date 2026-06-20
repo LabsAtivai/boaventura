@@ -266,10 +266,40 @@ async function garantirTelaPauta(page) {
     if (await btnUnidade.isVisible({ timeout: 2000 }).catch(() => false)) return;
   }
 
-  // Se ainda não visível, recarregar a navegação completa
-  warn("Recarregando navegação JTe...");
-  await abrirJTeSelecionarTRT2(page);
-  await abrirModuloPauta(page);
+  // Reload preserva o estado do SPA (TRT2 já selecionado + módulo Pauta)
+  warn("Recarregando página...");
+  await page.reload({ waitUntil: "networkidle", timeout: 60000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  if (await btnUnidade.isVisible({ timeout: 3000 }).catch(() => false)) return;
+
+  // Último recurso: navegar do zero
+  warn("Reload falhou — re-navegando do zero...");
+  await page.goto("https://jte.csjt.jus.br/start", { waitUntil: "networkidle", timeout: 60000 });
+  await page.waitForTimeout(2000);
+
+  try {
+    const btn = page.locator("ion-button,button").filter({ hasText: /^não$/i }).first();
+    if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await btn.click({ force: true });
+      await page.waitForLoadState("networkidle").catch(() => {});
+    }
+  } catch {}
+
+  // Clicar TRT2 — pode estar visível ou já selecionado
+  const trt2 = page.getByTestId("startListItemTribunal502");
+  if (await trt2.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await trt2.click({ force: true });
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await page.waitForTimeout(800);
+  }
+
+  // Abrir pauta se necessário
+  const cardPauta = page.locator('ion-card-content.card-content-modulo:has-text("Pauta")').first();
+  if (await cardPauta.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await cardPauta.click({ force: true });
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await page.waitForTimeout(800);
+  }
 }
 
 async function selecionarUnidade(page, varaLabel) {
