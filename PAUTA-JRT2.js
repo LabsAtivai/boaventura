@@ -157,13 +157,25 @@ async function matSel(page, loc, txt) {
 }
 
 async function abrirPainelEFiltrar(page) {
-  const botaoUnidade = page.getByTestId("pautaButtonSelecaoUnidade");
-  await botaoUnidade.waitFor({ state: "visible", timeout: 20000 });
-  await botaoUnidade.click({ force: true });
-  await page.waitForSelector('h1.tituloSelecaoTribunal:has-text("Órgão")', { timeout: 20000 });
-  await matSel(page, page.locator('mat-form-field[data-testid="selecaoTribunal"] mat-select'), "Audiências 1º grau");
-  await matSel(page, page.locator('mat-form-field[data-testid="municipio"] mat-select'), "São Paulo - Zonas Central, Norte e Oeste");
-  await page.waitForSelector('mat-form-field[data-testid="orgao"] mat-select[aria-disabled="false"]', { timeout: 20000 });
+  await retryOperation(page, async () => {
+    await fecharOverlays(page);
+    // Fechar painel se já estiver aberto (toggle)
+    const h1Existente = page.locator('h1.tituloSelecaoTribunal');
+    if (await h1Existente.isVisible({ timeout: 500 }).catch(() => false)) {
+      await page.getByTestId("ButtonCancelar").click().catch(() => {});
+      await page.waitForTimeout(1000);
+    }
+
+    const botaoUnidade = page.getByTestId("pautaButtonSelecaoUnidade");
+    await botaoUnidade.waitFor({ state: "visible", timeout: 20000 });
+    await botaoUnidade.click({ force: true });
+    await page.waitForTimeout(1000);
+    await page.waitForSelector('h1.tituloSelecaoTribunal', { timeout: 20000 });
+
+    await matSel(page, page.locator('mat-form-field[data-testid="selecaoTribunal"] mat-select'), "Audiências 1º grau");
+    await matSel(page, page.locator('mat-form-field[data-testid="municipio"] mat-select'), "São Paulo - Zonas Central, Norte e Oeste");
+    await page.waitForSelector('mat-form-field[data-testid="orgao"] mat-select[aria-disabled="false"]', { timeout: 20000 });
+  }, 3, 3000);
   return page.locator('mat-form-field[data-testid="orgao"] mat-select');
 }
 
@@ -237,9 +249,35 @@ async function listarVaras(page) {
    SELECIONAR UNIDADE
 ========================= */
 
+async function garantirTelaPauta(page) {
+  const btnUnidade = page.getByTestId("pautaButtonSelecaoUnidade");
+  if (await btnUnidade.isVisible({ timeout: 2000 }).catch(() => false)) return;
+
+  warn("Botão de unidade não visível — tentando recuperar...");
+
+  // Tentar voltar pela seta
+  const setaVoltar = page.locator("ion-back-button, ion-button").filter({
+    has: page.locator('ion-icon[name="arrow-back"]'),
+  }).first();
+  if (await setaVoltar.isVisible({ timeout: 1000 }).catch(() => false)) {
+    await setaVoltar.click({ force: true });
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await page.waitForTimeout(1500);
+    if (await btnUnidade.isVisible({ timeout: 2000 }).catch(() => false)) return;
+  }
+
+  // Se ainda não visível, recarregar a navegação completa
+  warn("Recarregando navegação JTe...");
+  await abrirJTeSelecionarTRT2(page);
+  await abrirModuloPauta(page);
+}
+
 async function selecionarUnidade(page, varaLabel) {
   log(`Selecionando vara: ${varaLabel}`);
   await fecharOverlays(page);
+  await fecharPopovers(page);
+  await garantirTelaPauta(page);
+
   const selectOrgao = await abrirPainelEFiltrar(page);
   await selectOrgao.click();
   const opcao = page.locator(".mat-mdc-select-panel mat-option").filter({ hasText: varaLabel }).first();
@@ -383,17 +421,29 @@ function analisarPoloPassivo(texto) {
   return polos;
 }
 
+async function fecharPopovers(page) {
+  await page.evaluate(() => {
+    document.querySelectorAll("ion-popover").forEach((p) => p.dismiss?.());
+  }).catch(() => {});
+  await page.waitForTimeout(300);
+}
+
 async function verificarDetalhes(page, procItem) {
   try {
+    await fecharPopovers(page);
+
+    // Scroll o card do processo até ficar visível e clicável
+    await page.evaluate((el) => {
+      el.scrollIntoView({ block: "center", behavior: "instant" });
+    }, await procItem.elementHandle().catch(() => null)).catch(() => {});
+    await page.waitForTimeout(300);
+
     const tresPontos = procItem.locator('ion-icon[name="ellipsis-vertical-outline"]').first();
-    await tresPontos.scrollIntoViewIfNeeded().catch(() => {});
-    await tresPontos.click({ force: true });
-    await page.waitForTimeout(800);
+    await tresPontos.click({ force: true, timeout: 5000 });
+    await page.waitForTimeout(1000);
 
-    const popover = page.locator("ion-popover").first();
-    await popover.waitFor({ state: "visible", timeout: 5000 });
-
-    const btnDetalhes = popover.locator("ion-item, button").filter({ hasText: /detalh/i }).first();
+    const btnDetalhes = page.locator("ion-popover ion-item").filter({ hasText: /Detalhes do processo/i }).first();
+    await btnDetalhes.waitFor({ state: "visible", timeout: 5000 });
     await btnDetalhes.click({ force: true });
     await page.waitForTimeout(1500);
     await page.waitForLoadState("networkidle").catch(() => {});
@@ -418,8 +468,8 @@ async function verificarDetalhes(page, procItem) {
     return polos;
   } catch (e) {
     warn(`Erro ao verificar detalhes: ${e.message}`);
-    // Tentar voltar mesmo com erro
     try {
+      await fecharPopovers(page);
       const setaVoltar = page.locator("ion-back-button, ion-button").filter({
         has: page.locator('ion-icon[name="arrow-back"]'),
       }).first();
@@ -450,7 +500,7 @@ function nomesPolosSemAdvogado(polos) {
    MAIN
 ========================= */
 
-const HEADLESS = process.env.HEADLESS !== "false";
+const HEADLESS = false;
 
 async function main() {
   const browser = await chromium.launch({ headless: HEADLESS });

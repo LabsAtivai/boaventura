@@ -298,16 +298,28 @@ function analisarPoloPassivo(texto) {
   return polos;
 }
 
+async function fecharPopovers(page) {
+  await page.evaluate(() => {
+    document.querySelectorAll("ion-popover").forEach((p) => p.dismiss?.());
+  }).catch(() => {});
+  await page.waitForTimeout(300);
+}
+
 async function verificarDetalhes(page, procItem) {
   try {
-    const tresPontos = procItem.locator('ion-icon[name="ellipsis-vertical-outline"]').first();
-    await tresPontos.scrollIntoViewIfNeeded().catch(() => {});
-    await tresPontos.click({ force: true });
-    await page.waitForTimeout(800);
+    await fecharPopovers(page);
 
-    const popover = page.locator("ion-popover").first();
-    await popover.waitFor({ state: "visible", timeout: 5000 });
-    const btnDetalhes = popover.locator("ion-item, button").filter({ hasText: /detalh/i }).first();
+    await page.evaluate((el) => {
+      el.scrollIntoView({ block: "center", behavior: "instant" });
+    }, await procItem.elementHandle().catch(() => null)).catch(() => {});
+    await page.waitForTimeout(300);
+
+    const tresPontos = procItem.locator('ion-icon[name="ellipsis-vertical-outline"]').first();
+    await tresPontos.click({ force: true, timeout: 5000 });
+    await page.waitForTimeout(1000);
+
+    const btnDetalhes = page.locator("ion-popover ion-item").filter({ hasText: /Detalhes do processo/i }).first();
+    await btnDetalhes.waitFor({ state: "visible", timeout: 5000 });
     await btnDetalhes.click({ force: true });
     await page.waitForTimeout(1500);
     await page.waitForLoadState("networkidle").catch(() => {});
@@ -331,6 +343,7 @@ async function verificarDetalhes(page, procItem) {
   } catch (e) {
     console.warn(`⚠️  Erro detalhes: ${e.message}`);
     try {
+      await fecharPopovers(page);
       const setaVoltar = page.locator("ion-back-button, ion-button").filter({
         has: page.locator('ion-icon[name="arrow-back"]'),
       }).first();
